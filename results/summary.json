@@ -1,0 +1,27 @@
+{
+  "grafts": 174,
+  "unit coupling": {
+    "residual_std_c": 2.75,
+    "p99_abs_residual_c": 8.61,
+    "false_alarms_per_turbine_month": 7.79,
+    "heat_cool_ratio": 4.23,
+    "detected_pct": 97.1,
+    "median_minutes_to_detect": 310.0,
+    "beats_static_rule_pct": 41.4,
+    "median_lead_vs_static_min": -20.0
+  },
+  "fitted coupling": {
+    "residual_std_c": 1.48,
+    "p99_abs_residual_c": 4.43,
+    "false_alarms_per_turbine_month": 1.4,
+    "heat_cool_ratio": 0.65,
+    "detected_pct": 100.0,
+    "median_minutes_to_detect": 240.0,
+    "beats_static_rule_pct": 67.2,
+    "median_lead_vs_static_min": 60.0
+  },
+  "static rule": {
+    "detected_pct": 100.0,
+    "median_minutes_to_detect": 305.0
+  }
+}

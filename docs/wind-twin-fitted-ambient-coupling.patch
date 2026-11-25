@@ -1,0 +1,292 @@
+diff --git a/crates/twin-physics/src/enrich.rs b/crates/twin-physics/src/enrich.rs
+index ab2eb50..c4c8c3b 100644
+--- a/crates/twin-physics/src/enrich.rs
++++ b/crates/twin-physics/src/enrich.rs
+@@ -301,6 +301,7 @@ mod tests {
+                     // Flat steady state: T_ss = ambient + 16.7 °C at any loss
+                     // (= 0.6 °C/kW × loss(900 kW) at the test's operating point).
+                     steady_state: vec![(2.5, 16.7), (62.5, 16.7)],
++                    ambient_coupling: Vec::new(),
+                     r_deg_per_kw: 0.6,
+                     fit_r2: 0.9,
+                     ambient_offset_c: 15.0,
+diff --git a/crates/twin-physics/src/thermal.rs b/crates/twin-physics/src/thermal.rs
+index 1900188..ca1367a 100644
+--- a/crates/twin-physics/src/thermal.rs
++++ b/crates/twin-physics/src/thermal.rs
+@@ -24,7 +24,17 @@
+ //!    matches the oil's real behavior. The reported τ (and the
+ //!    τ ∈ [0.5, 8] h golden) is the heating constant, the mode that matters
+ //!    for over-temperature detection.
+-//! 3. **Dynamics from the one-step regression.** α = Σ(T_ss−T)·ΔT / Σ(T_ss−T)²
++//! 3. **Ambient coupling is fitted, not assumed.** The gearbox oil runs
++//!    through a thermostatic cooler, so it does not follow the outdoor
++//!    temperature one-for-one: on this archive the oil moves only
++//!    0.06–0.45 °C per °C of ambient, rising with load. Each loss bin
++//!    therefore stores T_ss = a + k·T_amb with k from a per-bin least-squares
++//!    slope (clamped to [0, 1]; k = 1 when the bin's ambient span is too
++//!    narrow to fit). Assuming k = 1 pushes the weather into the residual as
++//!    a seasonal bias of several °C, and is also what made the fitted
++//!    heating constant look ~5× faster than cooling; with k fitted the two
++//!    constants come out similar.
++//! 4. **Dynamics from the one-step regression.** α = Σ(T_ss−T)·ΔT / Σ(T_ss−T)²
+ //!    per sign class — ordinary least squares minimizing one-step-ahead
+ //!    prediction error, as specified.
+ //!
+@@ -65,6 +75,10 @@ pub const LOSS_BIN_KW: f64 = 5.0;
+ pub const MIN_BIN_SAMPLES: usize = 20;
+ /// Slow adaptive bias-correction rate per 10-min interval (deployment).
+ pub const ADAPT_BETA: f64 = 0.03;
++/// Minimum ambient span (°C) within a loss bin to fit its ambient coupling.
++pub const MIN_AMBIENT_SPAN_C: f64 = 5.0;
++/// Ambient at which [`ThermalParams::steady_state_delta`] is reported.
++pub const REFERENCE_AMBIENT_C: f64 = 10.0;
+ 
+ /// Electrical power (kW) → drivetrain loss heat flow (kW) heating the oil.
+ pub fn loss_kw(power_elec_kw: f64) -> f64 {
+@@ -82,8 +96,13 @@ pub struct ThermalParams {
+     /// Heating time constant τ = −dt/ln(1−α_heat), hours — the diagnostic
+     /// number asserted by the golden.
+     pub tau_hours: f64,
+-    /// Steady-state curve: (loss bin center kW, median T − T_amb °C), sorted.
++    /// Steady-state curve: (loss bin center kW, median T − k·T_amb °C), sorted.
+     pub steady_state: Vec<(f64, f64)>,
++    /// Ambient coupling k per steady-state bin (°C oil per °C ambient), in
++    /// the same order as `steady_state`. Empty means k = 1 everywhere, which
++    /// keeps models cached before this field existed valid.
++    #[serde(default)]
++    pub ambient_coupling: Vec<f64>,
+     /// Equivalent linear thermal resistance (°C per kW of loss) — the
+     /// least-squares slope of the steady-state bins; informational sanity
+     /// number (the deployment uses the binned curve directly).
+@@ -99,30 +118,32 @@ pub struct ThermalParams {
+ 
+ impl ThermalParams {
+     /// Steady-state temperature rise above ambient (°C) at a given loss,
+-    /// linearly interpolated between bin medians, clamped at the ends.
++    /// reported at [`REFERENCE_AMBIENT_C`] (identical at any ambient when
++    /// k = 1).
+     pub fn steady_state_delta(&self, p_loss_kw: f64) -> f64 {
+-        let bins = &self.steady_state;
+-        if bins.is_empty() {
+-            return 0.0;
+-        }
+-        if p_loss_kw <= bins[0].0 {
+-            return bins[0].1;
+-        }
+-        if p_loss_kw >= bins[bins.len() - 1].0 {
+-            return bins[bins.len() - 1].1;
+-        }
+-        for w in bins.windows(2) {
+-            if p_loss_kw <= w[1].0 {
+-                let t = (p_loss_kw - w[0].0) / (w[1].0 - w[0].0);
+-                return w[0].1 + t * (w[1].1 - w[0].1);
+-            }
+-        }
+-        bins[bins.len() - 1].1
++        self.steady_state_temp(REFERENCE_AMBIENT_C, p_loss_kw) - REFERENCE_AMBIENT_C
+     }
+ 
+-    /// Steady-state oil temperature for a given ambient and loss.
++    /// Steady-state oil temperature for a given ambient and loss:
++    /// T_ss = a(loss) + k(loss)·T_amb, both linearly interpolated between
++    /// bins and clamped at the ends.
+     pub fn steady_state_temp(&self, t_amb: f64, p_loss_kw: f64) -> f64 {
+-        t_amb + self.steady_state_delta(p_loss_kw)
++        let bins = &self.steady_state;
++        if bins.is_empty() {
++            return t_amb;
++        }
++        let offset = interp(bins.len(), |i| bins[i].0, |i| bins[i].1, p_loss_kw);
++        let coupling = if self.ambient_coupling.len() == bins.len() {
++            interp(
++                bins.len(),
++                |i| bins[i].0,
++                |i| self.ambient_coupling[i],
++                p_loss_kw,
++            )
++        } else {
++            1.0
++        };
++        offset + coupling * t_amb
+     }
+ 
+     /// One physics step over `dt_s` seconds (no adaptation): exact
+@@ -140,6 +161,32 @@ impl ThermalParams {
+     }
+ }
+ 
++/// Piecewise-linear interpolation over `n` sorted points, clamped at the ends.
++fn interp(n: usize, x: impl Fn(usize) -> f64, y: impl Fn(usize) -> f64, at: f64) -> f64 {
++    if at <= x(0) {
++        return y(0);
++    }
++    for i in 1..n {
++        if at <= x(i) {
++            let t = (at - x(i - 1)) / (x(i) - x(i - 1));
++            return y(i - 1) + t * (y(i) - y(i - 1));
++        }
++    }
++    y(n - 1)
++}
++
++/// Least-squares slope of `y` on `x`; `None` when `x` has no spread.
++fn slope(x: &[f64], y: &[f64]) -> Option<f64> {
++    let n = x.len() as f64;
++    let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
++    let sxx: f64 = x.iter().map(|v| (v - mx) * (v - mx)).sum();
++    if sxx < 1e-9 {
++        return None;
++    }
++    let sxy: f64 = x.iter().zip(y).map(|(a, b)| (a - mx) * (b - my)).sum();
++    Some(sxy / sxx)
++}
++
+ /// Fit the thermal NBM for one turbine slot from the archive.
+ ///
+ /// Healthy-data filter ("status `running`, no alarms"):
+@@ -189,24 +236,36 @@ pub fn fit_turbine(pivot: &Pivot, slot: usize) -> Option<ThermalParams> {
+         &pts[..]
+     };
+ 
+-    // Stage 1 — steady state: median (T − T_amb) per 5 kW loss bin.
+-    let mut buckets: Vec<Vec<f64>> = vec![Vec::new(); 14]; // 0..70 kW
++    // Stage 1 — steady state per 5 kW loss bin: ambient coupling k from a
++    // least-squares slope of T on T_amb, then offset a = median(T − k·T_amb).
++    let mut buckets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); 14]; // 0..70 kW
+     for &(t0, _, t_amb, loss) in pts {
+         let b = (loss / LOSS_BIN_KW) as usize;
+         if b < buckets.len() {
+-            buckets[b].push(t0 - t_amb);
++            buckets[b].push((t0, t_amb));
+         }
+     }
+-    let steady_state: Vec<(f64, f64)> = buckets
+-        .iter()
+-        .enumerate()
+-        .filter(|(_, v)| v.len() >= MIN_BIN_SAMPLES)
+-        .map(|(b, v)| {
+-            let mut v = v.clone();
+-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+-            ((b as f64 + 0.5) * LOSS_BIN_KW, v[v.len() / 2])
+-        })
+-        .collect();
++    let mut steady_state: Vec<(f64, f64)> = Vec::new();
++    let mut ambient_coupling: Vec<f64> = Vec::new();
++    for (b, v) in buckets.iter().enumerate() {
++        if v.len() < MIN_BIN_SAMPLES {
++            continue;
++        }
++        let temps: Vec<f64> = v.iter().map(|p| p.0).collect();
++        let ambients: Vec<f64> = v.iter().map(|p| p.1).collect();
++        let (lo, hi) = ambients
++            .iter()
++            .fold((f64::MAX, f64::MIN), |(lo, hi), &a| (lo.min(a), hi.max(a)));
++        let k = if hi - lo > MIN_AMBIENT_SPAN_C {
++            slope(&ambients, &temps).map_or(1.0, |k| k.clamp(0.0, 1.0))
++        } else {
++            1.0
++        };
++        let mut offsets: Vec<f64> = v.iter().map(|&(t, a)| t - k * a).collect();
++        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
++        steady_state.push(((b as f64 + 0.5) * LOSS_BIN_KW, offsets[offsets.len() / 2]));
++        ambient_coupling.push(k);
++    }
+     if steady_state.len() < 4 {
+         return None;
+     }
+@@ -220,27 +279,23 @@ pub fn fit_turbine(pivot: &Pivot, slot: usize) -> Option<ThermalParams> {
+         });
+     let r_deg_per_kw = (n_b * sxy - sx * sy) / (n_b * sxx - sx * sx);
+ 
+-    let interp = |bins: &[(f64, f64)], loss: f64| -> f64 {
+-        if loss <= bins[0].0 {
+-            return bins[0].1;
+-        }
+-        if loss >= bins[bins.len() - 1].0 {
+-            return bins[bins.len() - 1].1;
+-        }
+-        for w in bins.windows(2) {
+-            if loss <= w[1].0 {
+-                let t = (loss - w[0].0) / (w[1].0 - w[0].0);
+-                return w[0].1 + t * (w[1].1 - w[0].1);
+-            }
+-        }
+-        bins[bins.len() - 1].1
++    // Steady-state model used by the dynamics fit and the R² below.
++    let model = ThermalParams {
++        alpha_heat: 0.0,
++        alpha_cool: 0.0,
++        tau_hours: 0.0,
++        steady_state,
++        ambient_coupling,
++        r_deg_per_kw,
++        fit_r2: 0.0,
++        ambient_offset_c: 0.0,
+     };
+ 
+     // Stage 2 — dynamics: one-step least squares per sign class,
+     // ΔT = α·(T_ss − T) + ε  →  α = Σ(T_ss−T)·ΔT / Σ(T_ss−T)².
+     let (mut nh, mut dh, mut nc, mut dc) = (0.0, 0.0, 0.0, 0.0);
+     for &(t0, t1, t_amb, loss) in pts {
+-        let gap = t_amb + interp(&steady_state, loss) - t0;
++        let gap = model.steady_state_temp(t_amb, loss) - t0;
+         let dt = t1 - t0;
+         if gap >= 0.0 {
+             nh += gap * dt;
+@@ -265,7 +320,7 @@ pub fn fit_turbine(pivot: &Pivot, slot: usize) -> Option<ThermalParams> {
+     let mean_t1 = pts.iter().map(|p| p.1).sum::<f64>() / n;
+     let (mut ss_res, mut ss_tot) = (0.0, 0.0);
+     for &(t0, t1, t_amb, loss) in pts {
+-        let ss = t_amb + interp(&steady_state, loss);
++        let ss = model.steady_state_temp(t_amb, loss);
+         let a = if ss >= t0 { alpha_heat } else { alpha_cool };
+         let pred = t0 + a * (ss - t0);
+         ss_res += (t1 - pred) * (t1 - pred);
+@@ -280,10 +335,9 @@ pub fn fit_turbine(pivot: &Pivot, slot: usize) -> Option<ThermalParams> {
+         alpha_heat,
+         alpha_cool,
+         tau_hours,
+-        steady_state,
+-        r_deg_per_kw,
+         fit_r2,
+         ambient_offset_c,
++        ..model
+     })
+ }
+ 
+@@ -405,6 +459,7 @@ mod tests {
+                 (32.5, base + 30.0 * slope),
+                 (62.5, base + 60.0 * slope),
+             ],
++            ambient_coupling: Vec::new(),
+             r_deg_per_kw: slope,
+             fit_r2: 1.0,
+             ambient_offset_c: 0.0,
+@@ -438,6 +493,26 @@ mod tests {
+         assert!((model - t_ss).abs() < 0.01, "converges to T_ss");
+     }
+ 
++    /// Fitted ambient coupling: a bin with k < 1 moves the steady state by
++    /// k per °C of ambient; an empty coupling list keeps the legacy k = 1.
++    #[test]
++    fn steady_state_follows_fitted_ambient_coupling() {
++        let mut p = params(0.05, 0.05, 30.0, 0.2);
++        let legacy = p.steady_state_temp(20.0, 32.5) - p.steady_state_temp(10.0, 32.5);
++        assert!((legacy - 10.0).abs() < 1e-9, "legacy coupling must be 1");
++        p.ambient_coupling = vec![0.1, 0.3, 0.5];
++        let rise = p.steady_state_temp(20.0, 32.5) - p.steady_state_temp(10.0, 32.5);
++        assert!(
++            (rise - 3.0).abs() < 1e-9,
++            "k = 0.3 at the middle bin: {rise}"
++        );
++        let between = p.steady_state_temp(20.0, 47.5) - p.steady_state_temp(10.0, 47.5);
++        assert!(
++            (between - 4.0).abs() < 1e-9,
++            "k interpolates to 0.4: {between}"
++        );
++    }
++
+     /// Fit recovers known parameters from synthetic data generated with the
+     /// same model (both sign classes exercised).
+     #[test]
